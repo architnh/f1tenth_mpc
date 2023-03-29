@@ -118,7 +118,7 @@ class MPC(Node):
         """
         # Initialize and create vectors for the optimization problem
         # Vehicle State Vector
-        self.xk = cvxpy.Variable(
+        self.xk = cvxpy.Variable(self
             (self.config.NXK, self.config.TK + 1)
         )
         # Control Input vector
@@ -152,15 +152,18 @@ class MPC(Node):
 
         # --------------------------------------------------------
         # TODO: fill in the objectives here, you should be using cvxpy.quad_form() somehwhere
-
         # TODO: Objective part 1: Influence of the control inputs: Inputs u multiplied by the penalty R
-        
+        objective += cvxpy.quad_form((np.transpose(self.uk)).flatten(), R_block)
 
         # TODO: Objective part 2: Deviation of the vehicle from the reference trajectory weighted by Q, including final Timestep T weighted by Qf
-        objective += cvxpy.quad_form(self.x0k - self.xk[:,self.config.TK])
+        # objective += cvxpy.quad_form(self.x0k - self.xk[:,self.config.TK])
+        objective += cvxpy.quad_form((np.transpose(self.ref_traj_k - self.xk)).flatten(), R_block)
+
+
 
         # TODO: Objective part 3: Difference from one control input to the next control input weighted by Rd
-
+        delta_uk = np.transpose((self.uk)[:-1,:] - (self.uk)[1:,:]).flatten() #shape=(14,)
+        objective += cvxpy.quad_form(delta_uk, Rd_block)
         # --------------------------------------------------------
 
         # Constraints 1: Calculate the future vehicle behavior/states based on the vehicle dynamics model matrices
