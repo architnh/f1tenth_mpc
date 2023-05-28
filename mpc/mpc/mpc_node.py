@@ -5,14 +5,21 @@ from dataclasses import dataclass, field
 import cvxpy
 import numpy as np
 import rclpy
-from ackermann_msgs.msg import AckermannDrive, AckermannDriveStamped
-from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from scipy.linalg import block_diag
-from scipy.sparse import block_diag, csc_matrix, diags
+from ackermann_msgs.msg import AckermannDrive, AckermannDriveStamped
+from geometry_msgs.msg import Point
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+
 from utils import nearest_point
 
+from scipy.linalg import block_diag
+from scipy.sparse import block_diag, csc_matrix, diags
+from scipy.interpolate import splev, splprep
+from scipy.spatial.transform import Rotation as R
 # TODO CHECK: include needed ROS msg type headers and libraries
 
 
@@ -69,10 +76,27 @@ class MPC(Node):
     """
     def __init__(self):
         super().__init__('mpc_node')
-        # TODO: create ROS subscribers and publishers
-        #       use the MPC as a tracker (similar to pure pursuit)
+
+        filename = "sim_points.csv" 
+
+        # ROS subscribers and publishers
+        # use the MPC as a tracker (similar to pure pursuit)
+        self.pose_subscriber = self.create_subscription(Odometry, 'ego_racecar/odom', self.pose_callback, 1)
+        self.drive_publisher = self.create_publisher(AckermannDriveStamped, 'drive',1)
+        self.goal_points_publisher = self.create_publisher(MarkerArray, 'pp_goal_points',1)
+        self.spline_publisher = self.create_publisher(Marker, 'pp_spline',1)
+
         # TODO: get waypoints here
-        self.waypoints = None
+        self.waypoints = load_points(filename, scaler=1)
+        spline_data, uout = splprep(self.waypoints.T, s=0, per=True)
+        self.x_spline, self.y_spline = splev(np.linspace(0,1,1000), spline_data)
+        self.vx, self.vy = splev(uout, spline_data, der=1)
+        # print(len(self.x_spline))
+        self.pp_points_data = self.visualize_pp_goal_points()
+        self.pp_spline_data = self.visualize_spline()
+        #Publish Rviz Markers every 2 seconds
+        self.timer = self.create_timer(2, self.publish_rviz_data)#Publish waypoints
+
 
         self.config = mpc_config()
         self.odelta_v = None
@@ -84,14 +108,31 @@ class MPC(Node):
         self.mpc_prob_init()
 
     def pose_callback(self, pose_msg):
-        pass
         # TODO: extract pose from ROS msg
-        vehicle_state = None
+        # Find the current waypoint to track using methods mentioned in lecture
+        current_position = pose_msg.pose.pose.position
+        current_quat = pose_msg.pose.pose.orientation
+
+        current_lin_vel = pose_msg.twist.twist.linear
+        current_ang_vel = pose_msg.twist.twist.angular
+
+        quaternion = [current_quat.x, current_quat.y, current_quat.z, current_quat.w]
+        euler = (R.from_quat(quaternion)).as_euler('zyx', degrees=False)
+        global_car_position = [current_position.x, current_position.y, current_position.z] # Current location of car in world frame
+
+        # Calculate immediate goal on Pure Pursuit Trajectory
+        spline_points = np.hstack((self.x_spline.reshape(-1,1), self.y_spline.reshape(-1,1), np.zeros_like(self.y_spline.reshape(-1,1))))
+        
+        # Calculate closest point on spline
+        norm_array = np.linalg.norm(spline_points - global_car_position, axis = 1)
+        closest_pt_idx = np.argmin(norm_array)
+
+        vehicle_state = [current_position.x, current_position.y, euler[-1], (current_lin_vel.x**2+current_lin_vel.y**2+current_lin_vel.z**2)**0.5]
 
         # TODO: Calculate the next reference trajectory for the next T steps
         #       with current vehicle pose.
         #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
-        ref_path = self.calc_ref_trajectory(self, vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
+        ref_path = self.calc_ref_trajectory(vehicle_state, self.waypoints[:,0], self.waypoints[:,1], np.zeros_like(self.waypoints[:,1]), (self.vx**2+self.vy**2)**0.5)
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
 
         # TODO: solve the MPC control problem
@@ -109,6 +150,11 @@ class MPC(Node):
         steer_output = self.odelta_v[0]
         speed_output = vehicle_state.v + self.oa[0] * self.config.DTK
 
+        msg = AckermannDriveStamped()
+        msg.drive.speed = speed_output #float(drive_speed)###CHANGE THIS BACK, IN SIM THE CHANGING VELOCITY WAS CAUSING PROBLEMS
+        msg.drive.steering_angle = float(steer_output)
+        self.drive_publisher.publish(msg)
+
     def mpc_prob_init(self):
         """
         Create MPC quadratic optimization problem using cvxpy, solver: OSQP
@@ -118,7 +164,7 @@ class MPC(Node):
         """
         # Initialize and create vectors for the optimization problem
         # Vehicle State Vector
-        self.xk = cvxpy.Variable(self
+        self.xk = cvxpy.Variable(
             (self.config.NXK, self.config.TK + 1)
         )
         # Control Input vector
@@ -137,11 +183,10 @@ class MPC(Node):
         self.ref_traj_k.value = np.zeros((self.config.NXK, self.config.TK + 1))
 
         # Initializes block diagonal form of R = [R, R, ..., R] (NU*T, NU*T)
-        R_block = block_diag(tuple([self.config.Rk] * self.config.TK))
+        R_block = block_diag(tuple([self.config.Rk] * self.config.TK)) # (16,16)
 
         # Initializes block diagonal form of Rd = [Rd, ..., Rd] (NU*(T-1), NU*(T-1))
         Rd_block = block_diag(tuple([self.config.Rdk] * (self.config.TK - 1)))
-
         # Initializes block diagonal form of Q = [Q, Q, ..., Qf] (NX*T, NX*T)
         Q_block = [self.config.Qk] * (self.config.TK)
         Q_block.append(self.config.Qfk)
@@ -153,17 +198,13 @@ class MPC(Node):
         # --------------------------------------------------------
         # TODO: fill in the objectives here, you should be using cvxpy.quad_form() somehwhere
         # TODO: Objective part 1: Influence of the control inputs: Inputs u multiplied by the penalty R
-        objective += cvxpy.quad_form((np.transpose(self.uk)).flatten(), R_block)
+        objective += cvxpy.quad_form(cvxpy.vec(self.uk), R_block)
 
         # TODO: Objective part 2: Deviation of the vehicle from the reference trajectory weighted by Q, including final Timestep T weighted by Qf
-        # objective += cvxpy.quad_form(self.x0k - self.xk[:,self.config.TK])
-        objective += cvxpy.quad_form((np.transpose(self.ref_traj_k - self.xk)).flatten(), R_block)
-
-
+        objective += cvxpy.quad_form(cvxpy.vec(self.xk - self.ref_traj_k), Q_block)
 
         # TODO: Objective part 3: Difference from one control input to the next control input weighted by Rd
-        delta_uk = np.transpose((self.uk)[:-1,:] - (self.uk)[1:,:]).flatten() #shape=(14,)
-        objective += cvxpy.quad_form(delta_uk, Rd_block)
+        objective += cvxpy.quad_form(cvxpy.vec(cvxpy.diff(self.uk, axis=1)), Rd_block)
         # --------------------------------------------------------
 
         # Constraints 1: Calculate the future vehicle behavior/states based on the vehicle dynamics model matrices
@@ -219,18 +260,26 @@ class MPC(Node):
         #       Add dynamics constraints to the optimization problem
         #       This constraint should be based on a few variables:
         #       self.xk, self.Ak_, self.Bk_, self.uk, and self.Ck_
-        
+        constraints += [cvxpy.vec(self.xk[:, 1:]) == self.Ak_ @ cvxpy.vec(self.xk[:, :-1]) + self.Bk_ @ cvxpy.vec(self.uk) + (self.Ck_)]
+
         # TODO: Constraint part 2:
         #       Add constraints on steering, change in steering angle
         #       cannot exceed steering angle speed limit. Should be based on:
         #       self.uk, self.config.MAX_DSTEER, self.config.DTK
+        constraints += [cvxpy.abs(cvxpy.diff(self.uk[1, :]))/self.config.DTK<=self.config.MAX_DSTEER]
 
         # TODO: Constraint part 3:
         #       Add constraints on upper and lower bounds of states and inputs
         #       and initial state constraint, should be based on:
         #       self.xk, self.x0k, self.config.MAX_SPEED, self.config.MIN_SPEED,
         #       self.uk, self.config.MAX_ACCEL, self.config.MAX_STEER
+        constraints += [cvxpy.vec(self.xk[:,0])==cvxpy.vec(self.x0k)]
         
+        constraints += [cvxpy.vec(self.xk[3,:])>=self.config.MIN_SPEED]
+        constraints += [cvxpy.vec(self.xk[3,:])<=self.config.MAX_SPEED]
+
+        constraints += [cvxpy.vec(self.uk[0,:])<=self.config.MAX_ACCEL]
+        constraints += [cvxpy.vec(self.uk[1,:])<=self.config.MAX_STEER]
         # -------------------------------------------------------------
 
         # Create the optimization problem in CVXPY and setup the workspace
@@ -424,6 +473,131 @@ class MPC(Node):
 
         return mpc_a, mpc_delta, mpc_x, mpc_y, mpc_yaw, mpc_v, path_predict
 
+    ########################### VISUALIZATION ############################
+    def visualize_pt(self, point):
+        array_values=MarkerArray()
+
+        message = Marker()
+        message.header.frame_id="map"
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.type= Marker.SPHERE
+        message.action = Marker.ADD
+        message.id=0
+        message.pose.orientation.x=0.0
+        message.pose.orientation.y=0.0
+        message.pose.orientation.z=0.0
+        message.pose.orientation.w=1.0
+        message.scale.x=0.2
+        message.scale.y=0.2
+        message.scale.z=0.2
+        message.color.a=1.0
+        message.color.r=1.0
+        message.color.b=1.0
+        message.color.g=0.0
+        message.pose.position.x=float(point[0])
+        message.pose.position.y=float(point[1])
+        message.pose.position.z=0.0
+        array_values.markers.append(message)
+        self.pp_goal_publisher.publish(message)
+    
+    def visualize_pp_goal_points(self):
+        array_values=MarkerArray()
+
+        for i in range(len(self.waypoints)):
+            message = Marker()
+            message.header.frame_id="map"
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.type= Marker.SPHERE
+            message.action = Marker.ADD
+            message.id=i
+            message.pose.orientation.x=0.0
+            message.pose.orientation.y=0.0
+            message.pose.orientation.z=0.0
+            message.pose.orientation.w=1.0
+            message.scale.x=0.2
+            message.scale.y=0.2
+            message.scale.z=0.2
+            message.color.a=1.0
+            message.color.r=1.0
+            message.color.b=0.0
+            message.color.g=0.0
+            message.pose.position.x=float(self.waypoints[i,0])
+            message.pose.position.y=float(self.waypoints[i,1])
+            message.pose.position.z=0.0
+            array_values.markers.append(message)
+        return array_values
+    
+    def visualize_spline(self):
+
+        message = Marker()
+        message.header.frame_id="map"
+        message.type= Marker.LINE_STRIP
+        message.action = Marker.ADD
+        message.pose.position.x= 0.0
+        message.pose.position.y= 0.0
+        message.pose.position.z=0.0
+        message.pose.orientation.x=0.0
+        message.pose.orientation.y=0.0
+        message.pose.orientation.z=0.0
+        message.pose.orientation.w=1.0
+        message.scale.x=0.1
+
+        message.color.a=1.0
+        message.color.r=0.0
+        message.color.b=1.0
+        message.color.g=1.0
+
+        for i in range(len(self.x_spline)-1):
+            message.id=i
+            message.header.stamp = self.get_clock().now().to_msg()
+
+            point1 = Point()
+            point1.x = float(self.x_spline[i])
+            point1.y = float(self.y_spline[i])
+            point1.z = 0.0
+            message.points.append(point1)
+
+            point2 = Point()
+            point2.x = float(self.x_spline[i+1])
+            point2.y = float(self.y_spline[i+1])
+            point2.z = 0.0
+            message.points.append(point2)
+            self.spline_publisher.publish(message)
+
+        return message
+    
+    def publish_rviz_data(self):
+        self.goal_points_publisher.publish(self.pp_points_data)
+        self.spline_publisher.publish(self.pp_spline_data)
+    ########################### VISUALIZATION ############################
+    
+def global_2_local(quaternion, pt_w, T_c_w):
+    # Transform goal point to vehicle frame of reference
+    rot = (R.as_matrix(R.from_quat(quaternion)))
+    pt_c = (np.array(pt_w) - np.array(T_c_w))@rot
+    """ 
+    # Alternate Method 
+    H_global2car = np.zeros([4, 4]) #rigid body transformation from  the global frame of referce to the car
+    H_global2car[3, 3] = 1
+    current_rotation_matrix = R.from_quat(np.array([current_quat.x,current_quat.y,current_quat.z,current_quat.w])).as_matrix()
+    H_global2car[0:3, 0:3] = np.array(current_rotation_matrix)
+    H_global2car[0:3, 3] = np.array([current_position.x, current_position.y, current_position.z])
+
+    # Calculate point
+    goal_point_global = np.append(pt_w, 1).reshape(4, 1)
+    pt_c = np.linalg.inv(H_global2car) @ goal_point_global
+    """
+    return pt_c
+
+def load_points(file, scaler=10):
+    # Open csv and read the waypoint data
+    with open(file, 'r') as f:
+        lines = (line for line in f if not line.startswith('#'))
+        data = np.loadtxt(lines, delimiter=',', dtype=float)
+    points = data / scaler
+
+    return points
+    
 def main(args=None):
     rclpy.init(args=args)
     print("MPC Initialized")
@@ -432,3 +606,6 @@ def main(args=None):
 
     mpc_node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
