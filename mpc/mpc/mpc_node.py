@@ -78,6 +78,7 @@ class MPC(Node):
         super().__init__('mpc_node')
 
         filename = "sim_points.csv" 
+        self.yaw_data = np.load('data.npz')
 
         # ROS subscribers and publishers
         # use the MPC as a tracker (similar to pure pursuit)
@@ -85,15 +86,20 @@ class MPC(Node):
         self.drive_publisher = self.create_publisher(AckermannDriveStamped, 'drive',1)
         self.goal_points_publisher = self.create_publisher(MarkerArray, 'pp_goal_points',1)
         self.spline_publisher = self.create_publisher(Marker, 'pp_spline',1)
+        self.mpc_path_publisher = self.create_publisher(Marker, 'mpc_spline',1)
+        self.pp_goal_publisher = self.create_publisher(Marker, 'pp_goal_point',1)
 
         # TODO: get waypoints here
         self.waypoints = load_points(filename, scaler=1)
         spline_data, uout = splprep(self.waypoints.T, s=0, per=True)
         self.x_spline, self.y_spline = splev(np.linspace(0,1,1000), spline_data)
-        self.vx, self.vy = splev(uout, spline_data, der=1)
+        self.vx      , self.vy       = splev(np.linspace(0,1,1000), spline_data, der=1)
+
+        self.spline_velocity = (self.vx**2 + self.vy**2)**0.5
         # print(len(self.x_spline))
         self.pp_points_data = self.visualize_pp_goal_points()
         self.pp_spline_data = self.visualize_spline()
+
         #Publish Rviz Markers every 2 seconds
         self.timer = self.create_timer(2, self.publish_rviz_data)#Publish waypoints
 
@@ -117,41 +123,83 @@ class MPC(Node):
         current_ang_vel = pose_msg.twist.twist.angular
 
         quaternion = [current_quat.x, current_quat.y, current_quat.z, current_quat.w]
-        euler = (R.from_quat(quaternion)).as_euler('zyx', degrees=False)
+        euler = (R.from_quat(quaternion)).as_euler('xyz', degrees=False)
         global_car_position = [current_position.x, current_position.y, current_position.z] # Current location of car in world frame
 
         # Calculate immediate goal on Pure Pursuit Trajectory
         spline_points = np.hstack((self.x_spline.reshape(-1,1), self.y_spline.reshape(-1,1), np.zeros_like(self.y_spline.reshape(-1,1))))
-        
+
+
+
+        # individual_rays = np.diff(spline_points)
+        individual_rays = np.diff(np.roll(spline_points,5)-spline_points)
+
+
+        ######### Calculate yaw at each point -->
+        # unit_rays = individual_rays/np.reshape(np.linalg.norm(individual_rays,axis =1),(-1,1))
+        # yaw_array = np.arccos(np.clip(np.dot(unit_rays, [1.0,0.0]), a_min=-1, a_max=1))
+        ######### OR method 2 ->
+        yaw_array = self.yaw_data['yaw'].flatten()
+
         # Calculate closest point on spline
         norm_array = np.linalg.norm(spline_points - global_car_position, axis = 1)
         closest_pt_idx = np.argmin(norm_array)
+        self.visualize_pt(spline_points[closest_pt_idx])
 
-        vehicle_state = [current_position.x, current_position.y, euler[-1], (current_lin_vel.x**2+current_lin_vel.y**2+current_lin_vel.z**2)**0.5]
+        # Check if car is oriented opposite the spline array direction
+        if(closest_pt_idx+10>(len(self.x_spline)-1)): idx = 10 
+        else: idx =  closest_pt_idx+10
+        sample_point = global_2_local(quaternion, spline_points[idx], global_car_position)
+        if sample_point[0]>0:
+            arangeit = np.arange(len(self.x_spline))
+            rollit = np.roll(arangeit, -closest_pt_idx)
+            # print(rollit)
+        else:
+            arangeit = np.flip(np.arange(len(self.x_spline)))
+            rollit = np.roll(arangeit, closest_pt_idx)
+        
+        spline_points = spline_points[rollit]
+        self.spline_velocity = self.spline_velocity[rollit]
+        yaw_array = yaw_array[rollit]
+
+        vehicle_state = State()
+        # print(vehicle_state.x)
+        vehicle_state.x = current_position.x
+        vehicle_state.y = current_position.y
+        vehicle_state.yaw = euler[-1]
+        vehicle_state.v = (current_lin_vel.x**2+current_lin_vel.y**2+current_lin_vel.z**2)**0.5
 
         # TODO: Calculate the next reference trajectory for the next T steps
         #       with current vehicle pose.
         #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
-        ref_path = self.calc_ref_trajectory(vehicle_state, self.waypoints[:,0], self.waypoints[:,1], np.zeros_like(self.waypoints[:,1]), (self.vx**2+self.vy**2)**0.5)
+        ref_x   = spline_points[:self.config.TK,0]
+        ref_y   = spline_points[:self.config.TK,1]
+        ref_yaw = yaw_array[:self.config.TK]
+        print("ref_yaw[0] in deg: ",np.rad2deg(ref_yaw[0]))
+        print("actual yaw in deg: ", np.rad2deg(euler[-1]))
+        ref_v   = self.spline_velocity[:self.config.TK]
+        ref_path = self.calc_ref_trajectory(vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
 
         # TODO: solve the MPC control problem
         (
             self.oa,
             self.odelta_v,
-            ox,
-            oy,
+            self.ox,
+            self.oy,
             oyaw,
             ov,
             state_predict,
         ) = self.linear_mpc_control(ref_path, x0, self.oa, self.odelta_v)
+        self.mpc_spline_data = self.visualize_mpc_path()
 
         # TODO: publish drive message.
         steer_output = self.odelta_v[0]
         speed_output = vehicle_state.v + self.oa[0] * self.config.DTK
 
         msg = AckermannDriveStamped()
-        msg.drive.speed = speed_output #float(drive_speed)###CHANGE THIS BACK, IN SIM THE CHANGING VELOCITY WAS CAUSING PROBLEMS
+        # msg.drive.speed = 0.0
+        msg.drive.speed = speed_output
         msg.drive.steering_angle = float(steer_output)
         self.drive_publisher.publish(msg)
 
@@ -319,6 +367,8 @@ class MPC(Node):
             np.cumsum(np.repeat(dind, self.config.TK)), 0, 0
         ).astype(int)
         ind_list[ind_list >= ncourse] -= ncourse
+        print("ind_list.shape: ", ind_list)
+        print(cx.shape)
         ref_traj[0, :] = cx[ind_list]
         ref_traj[1, :] = cy[ind_list]
         ref_traj[2, :] = sp[ind_list]
@@ -451,7 +501,7 @@ class MPC(Node):
 
     def linear_mpc_control(self, ref_path, x0, oa, od):
         """
-        MPC contorl with updating operational point iteraitvely
+        MPC control with updating operational point iteratively
         :param ref_path: reference trajectory in T steps
         :param x0: initial state vector
         :param oa: acceleration of T steps of last time
@@ -497,6 +547,8 @@ class MPC(Node):
         message.pose.position.x=float(point[0])
         message.pose.position.y=float(point[1])
         message.pose.position.z=0.0
+        message.lifetime.nanosec=int(1e8)
+
         array_values.markers.append(message)
         self.pp_goal_publisher.publish(message)
     
@@ -540,14 +592,15 @@ class MPC(Node):
         message.pose.orientation.y=0.0
         message.pose.orientation.z=0.0
         message.pose.orientation.w=1.0
-        message.scale.x=0.1
-
-        message.color.a=1.0
-        message.color.r=0.0
-        message.color.b=1.0
-        message.color.g=1.0
+        message.scale.x=0.05
 
         for i in range(len(self.x_spline)-1):
+            clr = 1 - (self.spline_velocity[i]-np.min(self.spline_velocity))/(np.max(self.spline_velocity) - np.min(self.spline_velocity))
+            message.color.a=1.0
+            message.color.r=clr
+            message.color.b=clr
+            message.color.g=clr
+
             message.id=i
             message.header.stamp = self.get_clock().now().to_msg()
 
@@ -566,9 +619,51 @@ class MPC(Node):
 
         return message
     
+    def visualize_mpc_path(self):
+
+        message = Marker()
+        message.header.frame_id="map"
+        message.type= Marker.LINE_STRIP
+        message.action = Marker.ADD
+        message.pose.position.x= 0.0
+        message.pose.position.y= 0.0
+        message.pose.position.z=0.0
+        message.pose.orientation.x=0.0
+        message.pose.orientation.y=0.0
+        message.pose.orientation.z=0.0
+        message.pose.orientation.w=1.0
+        message.scale.x=0.05
+        message.color.r=1.0
+        message.color.b=0.0
+        message.color.g=0.0
+        message.lifetime.nanosec=int(1e8)
+
+
+        for i in range(len(self.ox)-1):
+            message.color.a=1.0
+
+            message.id=i
+            message.header.stamp = self.get_clock().now().to_msg()
+
+            point1 = Point()
+            point1.x = float(self.ox[i])
+            point1.y = float(self.oy[i])
+            point1.z = 0.0
+            message.points.append(point1)
+
+            point2 = Point()
+            point2.x = float(self.ox[i+1])
+            point2.y = float(self.oy[i+1])
+            point2.z = 0.0
+            message.points.append(point2)
+            self.spline_publisher.publish(message)
+        return message
+    
     def publish_rviz_data(self):
         self.goal_points_publisher.publish(self.pp_points_data)
         self.spline_publisher.publish(self.pp_spline_data)
+        self.mpc_path_publisher.publish(self.mpc_spline_data)
+
     ########################### VISUALIZATION ############################
     
 def global_2_local(quaternion, pt_w, T_c_w):
