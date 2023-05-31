@@ -172,12 +172,12 @@ class MPC(Node):
         # TODO: Calculate the next reference trajectory for the next T steps
         #       with current vehicle pose.
         #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
-        ref_x   = spline_points[:self.config.TK,0]
-        ref_y   = spline_points[:self.config.TK,1]
-        ref_yaw = yaw_array[:self.config.TK]
-        print("ref_yaw[0] in deg: ",np.rad2deg(ref_yaw[0]))
-        print("actual yaw in deg: ", np.rad2deg(euler[-1]))
-        ref_v   = self.spline_velocity[:self.config.TK]
+        ref_x   = spline_points[:,0]
+        ref_y   = spline_points[:,1]
+        ref_yaw = yaw_array
+        # print("ref_yaw[0] in deg: ",np.rad2deg(ref_yaw[0]))
+        # print("actual yaw in deg: ", np.rad2deg(euler[-1]))
+        ref_v   = self.spline_velocity
         ref_path = self.calc_ref_trajectory(vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
 
@@ -198,8 +198,8 @@ class MPC(Node):
         speed_output = vehicle_state.v + self.oa[0] * self.config.DTK
 
         msg = AckermannDriveStamped()
-        # msg.drive.speed = 0.0
-        msg.drive.speed = speed_output
+        msg.drive.speed = 0.0
+        # msg.drive.speed = speed_output
         msg.drive.steering_angle = float(steer_output)
         self.drive_publisher.publish(msg)
 
@@ -367,8 +367,6 @@ class MPC(Node):
             np.cumsum(np.repeat(dind, self.config.TK)), 0, 0
         ).astype(int)
         ind_list[ind_list >= ncourse] -= ncourse
-        print("ind_list.shape: ", ind_list)
-        print(cx.shape)
         ref_traj[0, :] = cx[ind_list]
         ref_traj[1, :] = cy[ind_list]
         ref_traj[2, :] = sp[ind_list]
