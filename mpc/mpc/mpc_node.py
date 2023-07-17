@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation as R
 class mpc_config:
     NXK: int = 4  # length of kinematic state vector: z = [x, y, v, yaw]
     NU: int = 2  # length of input vector: u = = [steering speed, acceleration]
-    TK: int = 8  # finite time horizon length kinematic
+    TK: int = 24  # finite time horizon length kinematic
 
     # ---------------------------------------------------
     # TODO: you may need to tune the following matrices
@@ -46,17 +46,17 @@ class mpc_config:
     # ---------------------------------------------------
 
     N_IND_SEARCH: int = 20  # Search index number
-    DTK: float = 0.1  # time step [s] kinematic
+    DTK: float = 0.05  # time step [s] kinematic
     dlk: float = 0.03  # dist step [m] kinematic
     LENGTH: float = 0.58  # Length of the vehicle [m]
     WIDTH: float = 0.31  # Width of the vehicle [m]
     WB: float = 0.33  # Wheelbase [m]
     MIN_STEER: float = -0.4189  # maximum steering angle [rad]
-    MAX_STEER: float = 0.4189  # maximum steering angle [rad]
+    MAX_STEER: float =  0.4189  # maximum steering angle [rad]
     MAX_DSTEER: float = np.deg2rad(180.0)  # maximum steering speed [rad/s]
-    MAX_SPEED: float = 6.0  # maximum speed [m/s]
+    MAX_SPEED: float = 1.0  # maximum speed [m/s]
     MIN_SPEED: float = 0.0  # minimum backward speed [m/s]
-    MAX_ACCEL: float = 3.0  # maximum acceleration [m/ss]
+    MAX_ACCEL: float = 1.0  # maximum acceleration [m/ss]
 
 
 @dataclass
@@ -167,6 +167,8 @@ class MPC(Node):
         vehicle_state.x = current_position.x
         vehicle_state.y = current_position.y
         vehicle_state.yaw = euler[-1]
+        if vehicle_state.yaw<0:
+            vehicle_state.yaw = vehicle_state.yaw + 2*np.pi
         vehicle_state.v = (current_lin_vel.x**2+current_lin_vel.y**2+current_lin_vel.z**2)**0.5
 
         # TODO: Calculate the next reference trajectory for the next T steps
@@ -175,8 +177,12 @@ class MPC(Node):
         ref_x   = spline_points[:,0]
         ref_y   = spline_points[:,1]
         ref_yaw = yaw_array
-        # print("ref_yaw[0] in deg: ",np.rad2deg(ref_yaw[0]))
-        # print("actual yaw in deg: ", np.rad2deg(euler[-1]))
+        print(vehicle_state.y)
+        angle_flip_idx = np.where(ref_yaw<0)
+        ref_yaw[angle_flip_idx] = ref_yaw[angle_flip_idx] + 2*np.pi
+        print("ref_yaw[0] in deg: ",np.rad2deg(ref_yaw[0]))
+        print("actual yaw in deg: ", np.rad2deg(euler[-1]))
+        print(" ")
         ref_v   = self.spline_velocity
         ref_path = self.calc_ref_trajectory(vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
@@ -198,8 +204,8 @@ class MPC(Node):
         speed_output = vehicle_state.v + self.oa[0] * self.config.DTK
 
         msg = AckermannDriveStamped()
-        msg.drive.speed = 0.0
-        # msg.drive.speed = speed_output
+        # msg.drive.speed = 0.0
+        msg.drive.speed = speed_output
         msg.drive.steering_angle = float(steer_output)
         self.drive_publisher.publish(msg)
 
@@ -321,13 +327,13 @@ class MPC(Node):
         #       and initial state constraint, should be based on:
         #       self.xk, self.x0k, self.config.MAX_SPEED, self.config.MIN_SPEED,
         #       self.uk, self.config.MAX_ACCEL, self.config.MAX_STEER
-        constraints += [cvxpy.vec(self.xk[:,0])==cvxpy.vec(self.x0k)]
+        constraints += [self.xk[:,0]==self.x0k]
         
-        constraints += [cvxpy.vec(self.xk[3,:])>=self.config.MIN_SPEED]
-        constraints += [cvxpy.vec(self.xk[3,:])<=self.config.MAX_SPEED]
+        constraints += [self.xk[2,:]>=self.config.MIN_SPEED]
+        constraints += [self.xk[2,:]<=self.config.MAX_SPEED]
 
-        constraints += [cvxpy.vec(self.uk[0,:])<=self.config.MAX_ACCEL]
-        constraints += [cvxpy.vec(self.uk[1,:])<=self.config.MAX_STEER]
+        constraints += [cvxpy.abs(self.uk[0,:])<=self.config.MAX_ACCEL]
+        constraints += [cvxpy.abs(self.uk[1,:])<=self.config.MAX_STEER]
         # -------------------------------------------------------------
 
         # Create the optimization problem in CVXPY and setup the workspace
