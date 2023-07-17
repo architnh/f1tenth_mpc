@@ -1,5 +1,6 @@
 # f1tenth: Model Predictive Control
 
+<img src=data/mpc_sim.gif height="300" width="300" > <p></p>
 <!-- ## I. Learning Goals
 - Convex Optimization
 - Linearization and Discretization
@@ -109,4 +110,3 @@ We use CVXPY to set up the optimization problem with the OSQP solver.
 ## VI. Visualization
 Working Model Predictive Control on the f1tenth simulator.
 
-<img src=data/mpc_sim.gif height="300" width="300" > <p></p>
