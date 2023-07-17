@@ -108,4 +108,5 @@ We use CVXPY to set up the optimization problem with the OSQP solver.
 
 ## VI. Visualization
 Working Model Predictive Control on the f1tenth simulator.
-<img src=data/mpc_sim.gif height="400" width="400" > <p></p>
+
+<img src=data/mpc_sim.gif height="300" width="300" > <p></p>
